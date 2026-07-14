@@ -349,11 +349,26 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
-        let messages = context
+        let cache_control = cache_control_for(options.cache_retention);
+        let mut messages: Vec<_> = context
             .messages
             .iter()
             .map(convert_message_to_anthropic)
             .collect();
+        if let Some(cache_control) = cache_control {
+            for message in messages.iter_mut().rev() {
+                if let Some(content) = message
+                    .content
+                    .iter_mut()
+                    .rev()
+                    .find(|content| content.is_cacheable())
+                {
+                    content.set_cache_control(cache_control);
+                    break;
+                }
+            }
+        }
+        let has_system_prompt = context.system_prompt.is_some();
 
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
@@ -362,10 +377,29 @@ impl AnthropicProvider {
                 context
                     .tools
                     .iter()
-                    .map(convert_tool_to_anthropic)
+                    .enumerate()
+                    .map(|(index, tool)| {
+                        let is_last_static_tool =
+                            !has_system_prompt && index + 1 == context.tools.len();
+                        convert_tool_to_anthropic(
+                            tool,
+                            is_last_static_tool.then_some(cache_control).flatten(),
+                        )
+                    })
                     .collect(),
             )
         };
+        let system = context.system_prompt.as_deref().map(|prompt| {
+            if cache_control.is_some() {
+                AnthropicSystem::Cached(vec![AnthropicSystemBlock {
+                    r#type: "text",
+                    text: prompt,
+                    cache_control,
+                }])
+            } else {
+                AnthropicSystem::Text(prompt)
+            }
+        });
 
         // Build thinking configuration if enabled
         let thinking = options.thinking_level.and_then(|level| {
@@ -406,12 +440,13 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref(),
+            system,
             max_tokens,
             temperature,
             tools,
             stream: true,
             thinking,
+            cache_control,
         }
     }
 }
@@ -958,7 +993,7 @@ pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<AnthropicSystem<'a>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -967,12 +1002,48 @@ pub struct AnthropicRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Debug, Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
     budget_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum AnthropicSystem<'a> {
+    Text(&'a str),
+    Cached(Vec<AnthropicSystemBlock<'a>>),
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock<'a> {
+    r#type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+fn cache_control_for(retention: CacheRetention) -> Option<AnthropicCacheControl> {
+    let ttl = match retention {
+        CacheRetention::None => return None,
+        CacheRetention::Short => None,
+        CacheRetention::Long => Some("1h"),
+    };
+    Some(AnthropicCacheControl {
+        r#type: "ephemeral",
+        ttl,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -986,6 +1057,8 @@ struct AnthropicMessage<'a> {
 enum AnthropicContent<'a> {
     Text {
         text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
         thinking: &'a str,
@@ -993,18 +1066,52 @@ enum AnthropicContent<'a> {
     },
     Image {
         source: AnthropicImageSource<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     ToolUse {
         id: &'a str,
         name: &'a str,
         input: &'a serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     ToolResult {
         tool_use_id: &'a str,
         content: Vec<AnthropicToolResultContent<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+impl AnthropicContent<'_> {
+    fn is_cacheable(&self) -> bool {
+        !matches!(self, Self::Thinking { .. })
+    }
+
+    fn set_cache_control(&mut self, cache_control: AnthropicCacheControl) {
+        match self {
+            Self::Text {
+                cache_control: slot,
+                ..
+            }
+            | Self::Image {
+                cache_control: slot,
+                ..
+            }
+            | Self::ToolUse {
+                cache_control: slot,
+                ..
+            }
+            | Self::ToolResult {
+                cache_control: slot,
+                ..
+            } => *slot = Some(cache_control),
+            Self::Thinking { .. } => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1026,6 +1133,8 @@ struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
 }
 
 // ============================================================================
@@ -1174,6 +1283,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
             role: "user",
             content: vec![AnthropicContent::Text {
                 text: &custom.content,
+                cache_control: None,
             }],
         },
         Message::Assistant(assistant) => AnthropicMessage {
@@ -1206,6 +1316,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     })
                     .collect(),
                 is_error: if result.is_error { Some(true) } else { None },
+                cache_control: None,
             }],
         },
     }
@@ -1213,17 +1324,24 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
-        UserContent::Text(text) => vec![AnthropicContent::Text { text }],
+        UserContent::Text(text) => vec![AnthropicContent::Text {
+            text,
+            cache_control: None,
+        }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+                ContentBlock::Text(t) => Some(AnthropicContent::Text {
+                    text: &t.text,
+                    cache_control: None,
+                }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
                         r#type: "base64",
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
                 }),
                 _ => None,
             })
@@ -1233,11 +1351,15 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
-        ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+        ContentBlock::Text(t) => Some(AnthropicContent::Text {
+            text: &t.text,
+            cache_control: None,
+        }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
             name: &tc.name,
             input: &tc.arguments,
+            cache_control: None,
         }),
         // Thinking blocks must be echoed back with their signature for
         // multi-turn extended thinking.  Skip blocks without a signature
@@ -1257,11 +1379,15 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
     }
 }
 
-fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
+fn convert_tool_to_anthropic(
+    tool: &ToolDef,
+    cache_control: Option<AnthropicCacheControl>,
+) -> AnthropicTool<'_> {
     AnthropicTool {
         name: &tool.name,
         description: &tool.description,
         input_schema: &tool.parameters,
+        cache_control,
     }
 }
 
@@ -1364,7 +1490,10 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, Some("System prompt"));
+        assert!(matches!(
+            request.system,
+            Some(AnthropicSystem::Text("System prompt"))
+        ));
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
@@ -1377,7 +1506,7 @@ mod tests {
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(*text, "Ping"),
             other => panic!(),
         }
 
@@ -1405,11 +1534,138 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, None);
+        assert!(request.system.is_none());
         assert!(request.tools.is_none());
         assert!(request.thinking.is_none());
         assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(request.stream);
+    }
+
+    #[test]
+    fn test_build_request_caches_system_prompt_without_tools() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let body = serde_json::to_value(request).expect("serialize request");
+
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["system"][0]["cache_control"].get("ttl").is_none(),
+            "Anthropic defaults automatic caching to a 5-minute TTL"
+        );
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_caches_static_prefix_and_advances_history() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: vec![
+                ToolDef {
+                    name: "first".to_string(),
+                    description: "First tool.".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+                ToolDef {
+                    name: "last".to_string(),
+                    description: "Last tool.".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            ]
+            .into(),
+        };
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert!(body["tools"][1].get("cache_control").is_none());
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_caches_final_tool_without_system_prompt() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: None,
+            messages: Vec::new().into(),
+            tools: vec![
+                ToolDef {
+                    name: "first".to_string(),
+                    description: "First tool.".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+                ToolDef {
+                    name: "last".to_string(),
+                    description: "Last tool.".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            ]
+            .into(),
+        };
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_omits_cache_controls_when_disabled() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: Vec::new().into(),
+            tools: vec![ToolDef {
+                name: "echo".to_string(),
+                description: "Echo a string.".to_string(),
+                parameters: json!({"type": "object"}),
+            }]
+            .into(),
+        };
+
+        let body =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+
+        assert!(body.get("cache_control").is_none());
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["system"], "System prompt");
     }
 
     #[test]
@@ -1859,6 +2115,11 @@ mod tests {
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some("prompt-caching-2024-07-31")
         );
+        let body: serde_json::Value =
+            serde_json::from_str(&captured.body).expect("parse captured request body");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["system"][0]["cache_control"].get("ttl").is_none());
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
