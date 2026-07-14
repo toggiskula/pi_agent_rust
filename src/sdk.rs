@@ -50,8 +50,8 @@ pub use crate::model::{
 };
 pub use crate::models::{ModelEntry, ModelRegistry};
 pub use crate::provider::{
-    Context as ProviderContext, InputType, Model, ModelCost, Provider, StreamOptions,
-    ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
+    CacheRetention, Context as ProviderContext, InputType, Model, ModelCost, Provider,
+    StreamOptions, ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
 pub use crate::session::Session;
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
@@ -296,7 +296,9 @@ pub struct SessionOptions {
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
     pub include_cwd_in_prompt: bool,
+    pub include_current_datetime: bool,
     pub max_tool_iterations: usize,
+    pub cache_retention: CacheRetention,
 
     /// Optional factory for the session's [`ToolRegistry`].
     ///
@@ -350,7 +352,9 @@ impl Default for SessionOptions {
             extension_policy: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
+            include_current_datetime: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            cache_retention: CacheRetention::None,
             tool_factory: None,
             on_event: None,
             on_tool_start: None,
@@ -1620,12 +1624,14 @@ fn build_stream_options_with_optional_key(
     api_key: Option<String>,
     selection: &app::ModelSelection,
     session: &Session,
+    cache_retention: CacheRetention,
 ) -> StreamOptions {
     let mut options = StreamOptions {
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         thinking_level: Some(selection.thinking_level),
+        cache_retention,
         ..Default::default()
     };
 
@@ -1744,6 +1750,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &package_dir,
         std::env::var_os("PI_TEST_MODE").is_some(),
         options.include_cwd_in_prompt,
+        options.include_current_datetime,
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
@@ -1753,8 +1760,13 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
         .map_err(|err| Error::validation(err.to_string()))?;
 
-    let stream_options =
-        build_stream_options_with_optional_key(&config, api_key, &selection, &session);
+    let stream_options = build_stream_options_with_optional_key(
+        &config,
+        api_key,
+        &selection,
+        &session,
+        options.cache_retention,
+    );
 
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
@@ -1912,6 +1924,22 @@ mod tests {
         assert!(!provider.model_id().is_empty());
         assert_eq!(handle.model().0, provider.name());
         assert_eq!(handle.model().1, provider.model_id());
+    }
+
+    #[test]
+    fn create_agent_session_propagates_cache_retention() {
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            cache_retention: CacheRetention::Short,
+            ..hermetic_session_options(tmp.path())
+        };
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert_eq!(
+            handle.session().agent.stream_options().cache_retention,
+            CacheRetention::Short
+        );
     }
 
     #[test]

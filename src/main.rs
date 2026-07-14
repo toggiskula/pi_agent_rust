@@ -1385,6 +1385,7 @@ async fn run(
         &package_dir,
         test_mode,
         !cli.hide_cwd_in_prompt,
+        true,
     )?;
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -1559,6 +1560,7 @@ async fn run(
                         &package_dir,
                         test_mode,
                         !cli.hide_cwd_in_prompt,
+                        true,
                     )?;
                     agent_session.agent.set_system_prompt(Some(system_prompt));
                 }

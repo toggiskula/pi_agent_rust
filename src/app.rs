@@ -157,6 +157,7 @@ pub fn build_system_prompt(
     package_dir: &Path,
     test_mode: bool,
     include_cwd: bool,
+    include_current_datetime: bool,
 ) -> Result<String> {
     use std::fmt::Write as _;
 
@@ -189,12 +190,14 @@ pub fn build_system_prompt(
         prompt.push_str(skills_prompt);
     }
 
-    let date_time = if test_mode {
-        "<TIMESTAMP>".to_string()
-    } else {
-        format_current_datetime()
-    };
-    let _ = write!(prompt, "\nCurrent date and time: {date_time}");
+    if include_current_datetime {
+        let date_time = if test_mode {
+            "<TIMESTAMP>".to_string()
+        } else {
+            format_current_datetime()
+        };
+        let _ = write!(prompt, "\nCurrent date and time: {date_time}");
+    }
     if include_cwd {
         let cwd_display = if test_mode {
             "<CWD>".to_string()
