@@ -73,13 +73,34 @@ pub struct Client {
     vcr: Option<VcrRecorder>,
 }
 
+static TLS_CONNECTOR: std::sync::OnceLock<std::result::Result<TlsConnector, String>> =
+    std::sync::OnceLock::new();
+
+/// Trust the platform store and the bundled webpki roots together.
+///
+/// Native roots are mandatory behind a TLS-inspecting corporate proxy, whose signing
+/// CA exists only in the OS keychain. The webpki bundle is unioned in so that a
+/// keychain which fails to enumerate cannot leave the store empty, which asupersync
+/// rejects up front as an unusable connector rather than as a handshake failure.
+/// Cached because the macOS read goes through Security.framework and is slow.
+fn build_tls_connector() -> std::result::Result<TlsConnector, String> {
+    TlsConnectorBuilder::new()
+        .with_native_roots()
+        .unwrap_or_else(|_| TlsConnectorBuilder::new())
+        .with_webpki_roots()
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn shared_tls_connector() -> std::result::Result<TlsConnector, String> {
+    TLS_CONNECTOR.get_or_init(build_tls_connector).clone()
+}
+
 impl Client {
     #[must_use]
     pub fn new() -> Self {
-        let tls = TlsConnectorBuilder::new()
-            .with_native_roots()
-            .and_then(|builder| builder.alpn_protocols(vec![b"http/1.1".to_vec()]).build())
-            .map_err(|e| e.to_string());
+        let tls = shared_tls_connector();
 
         let user_agent = std::env::var(ANTIGRAVITY_VERSION_ENV).map_or_else(
             |_| DEFAULT_USER_AGENT.to_string(),
@@ -1158,6 +1179,26 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
+
+    // ── TLS roots ───────────────────────────────────────────────────────
+    #[test]
+    fn webpki_roots_alone_produce_a_usable_connector() {
+        // Guards the regression where a platform trust store that enumerated nothing
+        // left the root store empty, which asupersync rejects before any handshake as
+        // "no root certificates configured".
+        assert!(
+            TlsConnectorBuilder::new()
+                .with_webpki_roots()
+                .alpn_protocols(vec![b"http/1.1".to_vec()])
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn tls_connector_builds_from_native_and_webpki_roots() {
+        assert!(build_tls_connector().is_ok());
+    }
 
     // ── Method ──────────────────────────────────────────────────────────
     #[test]
