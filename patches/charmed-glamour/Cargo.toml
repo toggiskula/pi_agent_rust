@@ -1,0 +1,34 @@
+# ponytail: path-patch of crates.io charmed-glamour 0.2.0 solely to bump lru
+# 0.12 -> 0.16 (Dependabot GHSA-rhfx-m35p-ff5j). Drop when upstream publishes
+# a release that depends on lru >= 0.16.3.
+[package]
+edition = "2024"
+name = "charmed-glamour"
+version = "0.2.0"
+authors = ["Jeffrey Emanuel"]
+description = "Stylesheet-based markdown rendering for terminal applications"
+homepage = "https://github.com/Dicklesworthstone/charmed_rust"
+documentation = "https://docs.rs/charmed-glamour"
+readme = "README.md"
+keywords = ["markdown", "terminal", "tui", "rendering", "cli"]
+categories = ["command-line-interface", "text-processing"]
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/charmed_rust"
+
+[features]
+default = []
+serde = ["dep:serde"]
+syntax-highlighting = ["dep:syntect"]
+
+[lib]
+name = "glamour"
+path = "src/lib.rs"
+
+[dependencies]
+lipgloss = { version = "0.2.0", package = "charmed-lipgloss" }
+lru = "0.16"
+pulldown-cmark = "0.13"
+serde = { version = "1.0", features = ["derive"], optional = true }
+syntect = { version = "5", optional = true, default-features = false, features = ["default-fancy"] }
+tracing = "0.1"
+unicode-width = "0.1"

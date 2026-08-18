@@ -178,7 +178,7 @@ enable-ansi-support = "0.2"
 bubbletea = { package = "charmed-bubbletea", version = "0.2.0" }
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
 bubbles = { package = "charmed-bubbles", version = "0.2.0" }
-glamour = { package = "charmed-glamour", version = "0.2.0" }
+glamour = { package = "charmed-glamour", path = "patches/charmed-glamour" }
 unicode-width = "0.2"
 textwrap = "0.16"
 arboard = { version = "3.6.1", optional = true }
@@ -240,7 +240,7 @@ wasmtime = { version = "41.0.3", features = ["component-model"], optional = true
 image = { version = "0.25", optional = true }
 
 [build-dependencies]
-vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
@@ -387,3 +387,7 @@ module_name_repetitions = "allow"
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
 # sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
 # sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+
+# charmed-glamour is a path dep (patches/charmed-glamour) so the lru>=0.16
+# bump is visible to git dependents like Echo. crates.io [patch] alone would
+# not apply when this crate is consumed as a git dependency.
