@@ -7791,7 +7791,17 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous(Arc::new(on_event)).await
+        self.compact_now_with_instructions(None, on_event).await
+    }
+
+    /// Force-run compaction synchronously with optional custom instructions.
+    pub async fn compact_now_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.compact_synchronous(Arc::new(on_event), custom_instructions)
+            .await
     }
 
     pub async fn execute_extension_command(
@@ -8099,7 +8109,11 @@ impl AgentSession {
     }
 
     /// Run compaction synchronously (inline), blocking until completion.
-    async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<()> {
+    async fn compact_synchronous(
+        &self,
+        on_event: AgentEventHandler,
+        custom_instructions: Option<&str>,
+    ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -8117,7 +8131,8 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep =
+                compaction::prepare_compaction_forced(&entries, self.compaction_settings.clone());
             (entries, prep)
         };
 
@@ -8126,7 +8141,9 @@ impl AgentSession {
                 reason: "threshold".to_string(),
             });
 
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
+            let before_outcome = self
+                .dispatch_before_compact(&prep, &entries, custom_instructions)
+                .await;
             if before_outcome.cancel {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -8177,7 +8194,8 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            let compaction_result = compaction::compact(prep, provider, &credential, None).await;
+            let compaction_result =
+                compaction::compact(prep, provider, &credential, custom_instructions).await;
             self.extensions_is_compacting
                 .store(false, std::sync::atomic::Ordering::SeqCst);
 

@@ -1468,7 +1468,18 @@ impl AgentSessionHandle {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.session.compact_now(on_event).await
+        self.compact_with_instructions(None, on_event).await
+    }
+
+    /// Trigger an immediate compaction pass with optional custom instructions.
+    pub async fn compact_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.session
+            .compact_now_with_instructions(custom_instructions, on_event)
+            .await
     }
 
     /// Access the underlying `AgentSession`.

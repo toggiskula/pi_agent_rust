@@ -929,10 +929,7 @@ async fn generate_summary(
         SUMMARIZATION_PROMPT
     };
 
-    let mut prompt = base_prompt.to_string();
-    if let Some(custom) = custom_instructions.filter(|s| !s.trim().is_empty()) {
-        let _ = write!(prompt, "\n\nAdditional focus: {custom}");
-    }
+    let prompt = build_summary_prompt(base_prompt, custom_instructions);
 
     let llm_messages = messages
         .iter()
@@ -968,6 +965,14 @@ async fn generate_summary(
     }
 
     Ok(text)
+}
+
+fn build_summary_prompt(base_prompt: &str, custom_instructions: Option<&str>) -> String {
+    let mut prompt = base_prompt.to_string();
+    if let Some(custom) = custom_instructions.filter(|s| !s.trim().is_empty()) {
+        let _ = write!(prompt, "\n\nAdditional focus: {custom}");
+    }
+    prompt
 }
 
 async fn generate_turn_prefix_summary(
@@ -1015,6 +1020,26 @@ pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
+    prepare_compaction_internal(path_entries, settings, false)
+}
+
+/// Prepare compaction while bypassing only the automatic threshold gate.
+///
+/// This keeps all normal guards and cut-point/summary behavior intact, but
+/// allows explicit compaction requests to run below `window - reserve`.
+pub fn prepare_compaction_forced(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_internal(path_entries, settings, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_compaction_internal(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+    force_bypass_threshold: bool,
+) -> Option<CompactionPreparation> {
     if path_entries.is_empty() {
         return None;
     }
@@ -1050,7 +1075,9 @@ pub fn prepare_compaction(
     // of the history prior to the new cut point.
     let tokens_before = estimate_context_tokens(&usage_messages).tokens;
 
-    if !should_compact(tokens_before, settings.context_window_tokens, &settings) {
+    if !force_bypass_threshold
+        && !should_compact(tokens_before, settings.context_window_tokens, &settings)
+    {
         return None;
     }
 
@@ -1251,7 +1278,12 @@ pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value>
 mod tests {
     use super::*;
     use crate::model::{AssistantMessage, ContentBlock, TextContent, Usage};
+    use crate::provider::{Context, Provider, StreamOptions};
+    use async_trait::async_trait;
+    use futures::Stream;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::sync::Arc;
 
     fn make_user_text(text: &str) -> SessionMessage {
         SessionMessage::User {
@@ -1310,6 +1342,48 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticSummaryProvider;
+
+    #[async_trait]
+    impl Provider for StaticSummaryProvider {
+        fn name(&self) -> &str {
+            "static-summary"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<crate::model::StreamEvent>> + Send>>> {
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "## Goal\nforced-summary".to_string(),
+                ))],
+                api: "test-api".to_string(),
+                provider: "static-summary".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            let events = vec![Ok(crate::model::StreamEvent::Done {
+                message,
+                reason: StopReason::Stop,
+            })];
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
@@ -2158,6 +2232,33 @@ mod tests {
     }
 
     #[test]
+    fn prepare_compaction_forced_bypasses_threshold() {
+        let entries = vec![
+            user_entry("1", "short request"),
+            assistant_entry("2", "short response", 20, 10),
+            user_entry("3", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 100_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 5,
+        };
+
+        assert!(
+            prepare_compaction(&entries, settings.clone()).is_none(),
+            "automatic preparation stays threshold-gated"
+        );
+
+        let forced = prepare_compaction_forced(&entries, settings)
+            .expect("forced preparation should bypass threshold when content exists");
+        assert!(
+            !forced.messages_to_summarize.is_empty() || !forced.turn_prefix_messages.is_empty()
+        );
+        assert!(forced.tokens_before > 0);
+    }
+
+    #[test]
     fn prepare_compaction_after_previous_compaction() {
         let entries = vec![
             user_entry("1", "old message"),
@@ -2177,6 +2278,62 @@ mod tests {
         assert!(prep.is_some());
         let p = prep.unwrap();
         assert_eq!(p.previous_summary.as_deref(), Some("previous summary"));
+    }
+
+    #[test]
+    fn prepare_compaction_forced_preserves_previous_summary() {
+        let entries = vec![
+            user_entry("1", "old message"),
+            assistant_entry("2", "old response", 40, 20),
+            compact_entry("3", "previous summary", 300),
+            user_entry("4", "new note"),
+            assistant_entry("5", "new reply", 25, 10),
+            user_entry("6", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 100_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 5,
+        };
+
+        let prep = prepare_compaction_forced(&entries, settings)
+            .expect("forced compaction should prepare");
+        assert_eq!(prep.previous_summary.as_deref(), Some("previous summary"));
+    }
+
+    #[test]
+    fn forced_compaction_runs_below_threshold() {
+        let entries = vec![
+            user_entry("1", "short request"),
+            assistant_entry("2", "short response", 20, 10),
+            user_entry("3", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 100_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 5,
+        };
+
+        let prep = prepare_compaction_forced(&entries, settings).expect("forced preparation");
+        let result = futures::executor::block_on(compact(
+            prep,
+            Arc::new(StaticSummaryProvider),
+            "test-key",
+            None,
+        ))
+        .expect("forced compaction should run below threshold");
+
+        assert_eq!(result.first_kept_entry_id, "2");
+        assert!(result.summary.contains("forced-summary"));
+    }
+
+    #[test]
+    fn build_summary_prompt_includes_custom_instructions() {
+        let prompt = build_summary_prompt("base", Some("preserve names and URLs"));
+        assert!(prompt.contains("base"));
+        assert!(prompt.contains("Additional focus: preserve names and URLs"));
     }
 
     #[test]
