@@ -7786,7 +7786,11 @@ impl AgentSession {
         self.save_enabled
     }
 
-    /// Force-run compaction synchronously (used by `/compact` slash command).
+    /// Force-run compaction synchronously for SDK embedders.
+    ///
+    /// Bypasses only the automatic token threshold. Compaction must still be
+    /// enabled. The `/compact` slash command and RPC `compact` method keep
+    /// their own threshold-gated prepare path.
     pub async fn compact_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,

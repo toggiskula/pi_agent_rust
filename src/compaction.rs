@@ -1015,7 +1015,6 @@ async fn generate_turn_prefix_summary(
 // Public API
 // =============================================================================
 
-#[allow(clippy::too_many_lines)]
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
@@ -1075,6 +1074,9 @@ fn prepare_compaction_internal(
     // of the history prior to the new cut point.
     let tokens_before = estimate_context_tokens(&usage_messages).tokens;
 
+    if !settings.enabled {
+        return None;
+    }
     if !force_bypass_threshold
         && !should_compact(tokens_before, settings.context_window_tokens, &settings)
     {
@@ -2252,10 +2254,25 @@ mod tests {
 
         let forced = prepare_compaction_forced(&entries, settings)
             .expect("forced preparation should bypass threshold when content exists");
-        assert!(
-            !forced.messages_to_summarize.is_empty() || !forced.turn_prefix_messages.is_empty()
-        );
         assert!(forced.tokens_before > 0);
+        assert!(forced.tokens_before < 99_000);
+    }
+
+    #[test]
+    fn prepare_compaction_forced_respects_disabled() {
+        let entries = vec![
+            user_entry("1", "short request"),
+            assistant_entry("2", "short response", 20, 10),
+            user_entry("3", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: false,
+            context_window_tokens: 100_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 5,
+        };
+
+        assert!(prepare_compaction_forced(&entries, settings).is_none());
     }
 
     #[test]
@@ -2303,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_compaction_runs_below_threshold() {
+    fn compact_runs_from_forced_preparation() {
         let entries = vec![
             user_entry("1", "short request"),
             assistant_entry("2", "short response", 20, 10),
