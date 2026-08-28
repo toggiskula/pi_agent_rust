@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
+use std::sync::LazyLock;
 
 // ============================================================================
 // Constants
@@ -37,6 +38,7 @@ const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20"
 /// Override via `PI_ANTHROPIC_CACHE_BETA_FLAG`.
 const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
+static EMPTY_TOOL_INPUT: LazyLock<serde_json::Value> = LazyLock::new(|| serde_json::json!({}));
 
 fn anthropic_oauth_beta_flags() -> String {
     std::env::var("PI_ANTHROPIC_BETA_FLAGS")
@@ -1355,12 +1357,23 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
             text: &t.text,
             cache_control: None,
         }),
-        ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
-            id: &tc.id,
-            name: &tc.name,
-            input: &tc.arguments,
-            cache_control: None,
-        }),
+        ContentBlock::ToolCall(tc) => {
+            let input = if tc.arguments.is_object() {
+                &tc.arguments
+            } else {
+                tracing::warn!(
+                    tool_name = %tc.name,
+                    "Replacing non-object Anthropic tool input with an empty object for API replay"
+                );
+                &EMPTY_TOOL_INPUT
+            };
+            Some(AnthropicContent::ToolUse {
+                id: &tc.id,
+                name: &tc.name,
+                input,
+                cache_control: None,
+            })
+        }
         // Thinking blocks must be echoed back with their signature for
         // multi-turn extended thinking.  Skip blocks without a signature
         // (the API would reject them).
@@ -1407,7 +1420,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     #[test]
@@ -1441,6 +1454,92 @@ mod tests {
         let converted = convert_message_to_anthropic(&message);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.content.len(), 1);
+    }
+
+    #[test]
+    fn non_object_tool_input_is_safe_for_anthropic_replay() {
+        for arguments in [Value::Null, json!("cut off"), json!([1, 2])] {
+            let block = ContentBlock::ToolCall(ToolCall {
+                id: "tool_1".to_string(),
+                name: "echo_vault_edit".to_string(),
+                arguments: arguments.clone(),
+                thought_signature: None,
+            });
+
+            let converted = convert_content_block_to_anthropic(&block).unwrap();
+            let body = serde_json::to_value(converted).unwrap();
+
+            assert_eq!(body["input"], json!({}));
+            let ContentBlock::ToolCall(original) = &block else {
+                unreachable!();
+            };
+            assert_eq!(original.arguments, arguments);
+        }
+
+        let block = ContentBlock::ToolCall(ToolCall {
+            id: "tool_2".to_string(),
+            name: "echo_vault_edit".to_string(),
+            arguments: json!({"path": "report.html"}),
+            thought_signature: None,
+        });
+        let converted = convert_content_block_to_anthropic(&block).unwrap();
+        let body = serde_json::to_value(converted).unwrap();
+        assert_eq!(body["input"], json!({"path": "report.html"}));
+    }
+
+    #[test]
+    fn malformed_streamed_tool_input_is_safe_for_anthropic_replay() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 3 } }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "echo_vault_edit"
+                }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"path\":\"report.html\""
+                }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use" },
+                "usage": { "output_tokens": 5 }
+            }),
+            json!({
+                "type": "message_stop"
+            }),
+        ];
+
+        let message = collect_events(&events)
+            .into_iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall(tool_call) if tool_call.arguments.is_null()
+        ));
+
+        let replay = Message::Assistant(Arc::new(message));
+        let body = serde_json::to_value(convert_message_to_anthropic(&replay)).unwrap();
+        assert_eq!(body["content"][0]["input"], json!({}));
     }
 
     #[test]
